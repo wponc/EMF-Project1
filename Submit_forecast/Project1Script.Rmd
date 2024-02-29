@@ -10,16 +10,17 @@ knitr::opts_chunk$set(echo = TRUE)
 
 Loading packages
 ```{r load-packages, echo = F, warning=F, message=F}
-## install.packages('remotes')
-## install.packages('fpp3') # package for applying simple forecasting methods
-## install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
-## install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
-## install.packages('lubridate') # working with dates and times
-## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
+# install.packages('remotes')
+# install.packages('fpp3') # package for applying simple forecasting methods
+# install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
+# install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
+# install.packages('lubridate') # working with dates and times
+# remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
 # install.packages('tidymodels')
 # install.packages('xgboost')
 # Load packages
 
+library(remotes)
 library(tidyverse)
 library(lubridate)
 library(xgboost)
@@ -94,6 +95,7 @@ noaa_future_daily <- noaa_future |>
   select(any_of(c('datetime', 'site_id', met_variables, 'parameter')))
 ```
 
+
 ```{r}
 targets_df <- targets |> 
   filter(variable == 'temperature') |>
@@ -115,13 +117,12 @@ test_data <- testing(split)
 train_data
 # The columns for surface downwelling longwave & shortwave flux are both filled with NAs as we haven't filled them in
 
-
-
 # Creating our recipe
 our_recipe <- train_data |> 
   recipe(temperature ~  .) |> 
   step_rm(datetime) |>
-  step_naomit(surface_downwelling_shortwave_flux_in_air, surface_downwelling_longwave_flux_in_air, temperature)
+  step_naomit(surface_downwelling_shortwave_flux_in_air, surface_downwelling_longwave_flux_in_air, temperature) |>
+  step_dummy(site_id)
 our_recipe
 ```
 
@@ -156,22 +157,79 @@ fit
 
 
 **Step 5: Predict**
-
 ```{r}
+# Generating predictions
+predictions <- predict(fit, new_data = test_data)
+predictions
 
+# Binding predictions
+pred_test <- bind_cols(test_data, predictions)
+pred_test
 ```
 
 
 **Step 6: Evaluate Model**
 
 ```{r}
+multi_metric <- metric_set(rmse, rsq)
 
+metric_table <- pred_test |> 
+  multi_metric(truth = temperature, estimate = .pred)
+
+metric_table
 ```
 
 
 **Step 7: Deploy Model**
 
 ```{r}
+# Reading in new data
+targets_future <- noaa_future_daily |> 
+  mutate(temperature = NA,
+         doy = yday(datetime)) |> 
+  filter(parameter == 1) |> 
+  select(-parameter)
 
+targets_future
+
+# Using model fitting on training data to predict new data 
+new_predictions <- predict(fit, new_data = targets_future)
+
+targets_future <- noaa_future_daily |> 
+  mutate(temperature = NA,
+         doy = yday(datetime))
+
+tidymodels_forecast <- data.frame()
+
+
+for(i in unique(targets_future$parameter)){
+  curr_ens <- targets_future |> 
+    filter(parameter == i) |> 
+    select(-parameter)
+  
+  new_predictions <- predict(fit, new_data = curr_ens)
+  curr_ens <- bind_cols(curr_ens, new_predictions) |> 
+    mutate(parameter = i)
+  tidymodels_forecast <- bind_rows(tidymodels_forecast, curr_ens)
+}
+
+
+tidymodels_forecasts_EFI <- tidymodels_forecast %>%
+  rename(prediction = .pred) %>%
+  mutate(variable = "temperature") |> 
+  # For the EFI challenge we only want the forecast for future
+  filter(datetime > Sys.Date()) %>%
+  group_by(site_id, variable) %>%
+  mutate(reference_datetime = min(datetime) - lubridate::days(1),
+         family = "ensemble",
+         model_id = "tidymodels_lm") %>%
+  select(model_id, datetime, reference_datetime, site_id, family, parameter, variable, prediction)
+
+# Visualizing our predicted water temperature
+tidymodels_forecasts_EFI |>
+  filter(variable == "temperature") |>
+  ggplot(aes(x = datetime, y = prediction, group = parameter)) +
+  geom_line() + 
+  facet_wrap(~site_id)
 ```
 
