@@ -8,22 +8,170 @@ date: "`r Sys.Date()`"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+Loading packages
+```{r load-packages, echo = F, warning=F, message=F}
+## install.packages('remotes')
+## install.packages('fpp3') # package for applying simple forecasting methods
+## install.packages('tsibble') # package for dealing with time series data sets and tsibble objects
+## install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
+## install.packages('lubridate') # working with dates and times
+## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
+# install.packages('tidymodels')
+# install.packages('xgboost')
+# Load packages
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+library(tidyverse)
+library(lubridate)
+library(xgboost)
+library(tidymodels)
+tidymodels_prefer()
+set.seed(100)
 ```
 
-## Including Plots
+**Step 1: Obtaining data**
+```{r get-targets, message=F}
+#read in the targets data
+targets <- read_csv('https://data.ecoforecast.org/neon4cast-targets/aquatics/aquatics-targets.csv.gz')
 
-You can also embed plots, for example:
+# read in the sites data
+aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-targets/main/NEON_Field_Site_Metadata_20220412.csv") |>
+  dplyr::filter(aquatics == 1)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+lake_sites <- aquatic_sites %>%
+  filter(field_site_subtype == 'Lake')
+
+# Filter the targets for the variable we're trying to predict: WATER TEMP
+targets <- targets %>%
+  filter(site_id %in% lake_sites$field_site_id,
+         variable == 'temperature')
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+# variables that we're using as input: air temp, air pressure, precip flux
+met_variables <- c("surface_downwelling_longwave_flux_in_air", "surface_downwelling_shortwave_flux_in_air")
+
+# Past stacked weather
+noaa_past_s3 <- neon4cast::noaa_stage3()
+
+noaa_past <- noaa_past_s3  |> 
+  dplyr::filter(site_id %in% lake_sites$field_site_id,
+                datetime >= ymd('2017-01-01'),
+                variable %in% met_variables) |> 
+  dplyr::collect()
+
+# aggregate the past to mean values
+noaa_past_mean <- noaa_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  # convert air temperature to Celsius if it is included in the weather data
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+  pivot_wider(names_from = variable, values_from = prediction)
+```
+
+```{r}
+# Future weather
+# New forecast only available at 5am UTC the next day
+forecast_date <- Sys.Date() 
+noaa_date <- forecast_date - days(1)
+
+noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+
+noaa_future <- noaa_future_s3 |> 
+  dplyr::filter(datetime >= forecast_date,
+                site_id %in% lake_sites$field_site_id,
+                variable %in% met_variables) |> 
+  collect()
+
+noaa_future_daily <- noaa_future |> 
+  mutate(datetime = as_date(datetime)) |> 
+  # mean daily forecasts at each site per ensemble
+  group_by(datetime, site_id, parameter, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  # convert air temperature to Celsius if it is included in the weather data
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+  pivot_wider(names_from = variable, values_from = prediction) |> 
+  select(any_of(c('datetime', 'site_id', met_variables, 'parameter')))
+```
+
+```{r}
+targets_df <- targets |> 
+  filter(variable == 'temperature') |>
+  pivot_wider(names_from = 'variable', values_from = 'observation') |> 
+  left_join(noaa_past_mean, 
+            by = c("datetime","site_id")) |> 
+  mutate(doy = yday(datetime))
+```
+
+**Step 2: Preprocess Data**
+```{r}
+# Split data into training/testing sets
+split <- initial_split(targets_df, prop = 0.80, strata = site_id)
+split
+
+# Applying the training and testing functions to assign these datasets
+train_data <- training(split)
+test_data <- testing(split)
+train_data
+# The columns for surface downwelling longwave & shortwave flux are both filled with NAs as we haven't filled them in
+
+
+
+# Creating our recipe
+our_recipe <- train_data |> 
+  recipe(temperature ~  .) |> 
+  step_rm(datetime) |>
+  step_naomit(surface_downwelling_shortwave_flux_in_air, surface_downwelling_longwave_flux_in_air, temperature)
+our_recipe
+```
+
+
+
+
+**Step 3: Specify Model, Engine & Workflow**
+
+```{r}
+# Building model
+our_model <- boost_tree(mode = "regression") |> 
+  set_engine("xgboost")
+our_model
+
+# Specifying workflow steps
+wflow <-
+  workflow() |> 
+  add_model(our_model) |> 
+  add_recipe(our_recipe)
+wflow
+```
+
+
+**Step 4: Train Model**
+
+```{r}
+# fitting model on training data
+fit <- wflow |> 
+  fit(data = train_data)
+fit
+```
+
+
+**Step 5: Predict**
+
+```{r}
+
+```
+
+
+**Step 6: Evaluate Model**
+
+```{r}
+
+```
+
+
+**Step 7: Deploy Model**
+
+```{r}
+
+```
+
